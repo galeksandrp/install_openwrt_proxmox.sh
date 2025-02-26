@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Script to create an OpenWrt LXC container in Proxmox
-# Downloads from openwrt.org with latest stable version, detects bridges/devices, IDs, configures network, sets optional password
-# Pre-configures WAN/LAN in UCI, includes summary and confirmation
+# Downloads from openwrt.org with latest stable or snapshot version, detects bridges/devices, IDs, configures network, sets optional password
+# Pre-configures WAN/LAN in UCI, includes summary and confirmation, optional LuCI install for snapshots with apk
 
 # Default resource values
 DEFAULT_MEMORY="256"                      # MB
@@ -29,7 +29,7 @@ exit_script() {
 [ "$EUID" -ne 0 ] && exit_script 1 "Error: This script must be run as root"
 
 # Check required tools
-for cmd in wget pct pvesm ip curl whiptail pvesh bridge; do
+for cmd in wget pct pvesm ip curl whiptail pvesh bridge stat; do
     command -v "$cmd" &>/dev/null || exit_script 1 "Error: $cmd is not installed. Please install it first."
 done
 
@@ -119,11 +119,30 @@ prompt_with_default() {
 
 # Main execution
 echo -e "${GREEN}Fetching latest stable OpenWrt version...${NC}"
-VER=$(detect_latest_version)
-echo -e "${GREEN}Detected latest stable version: $VER${NC}"
-prompt_with_default "Enter OpenWrt version" "$VER" VER
-DOWNLOAD_URL="https://downloads.openwrt.org/releases/$VER/targets/x86/64/openwrt-$VER-x86-64-rootfs.tar.gz"
-TEMPLATE_FILE="openwrt-$VER-$ARCH.tar.gz"
+STABLE_VER=$(detect_latest_version)
+echo -e "${GREEN}Detected latest stable version: $STABLE_VER${NC}"
+
+# Select OpenWrt release type
+RELEASE_TYPE=$(whiptail --title "OpenWrt Release Type" --radiolist \
+    "Choose the OpenWrt release type (Stable allows manual version input):\nUse Spacebar to select." 10 60 2 \
+    "Stable" "Stable version (e.g., $STABLE_VER)" "ON" \
+    "Snapshot" "Latest daily snapshot" "OFF" 3>&1 1>&2 2>&3) || exit_script 1 "Error: Release type selection aborted"
+
+if [ "$RELEASE_TYPE" = "Stable" ]; then
+    prompt_with_default "Enter OpenWrt stable version" "$STABLE_VER" VER
+    DOWNLOAD_URL="https://downloads.openwrt.org/releases/$VER/targets/x86/64/openwrt-$VER-x86-64-rootfs.tar.gz"
+    TEMPLATE_FILE="openwrt-$VER-$ARCH.tar.gz"
+else
+    VER="snapshot"
+    DOWNLOAD_URL="https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-x86-64-rootfs.tar.gz"
+    TEMPLATE_FILE="openwrt-snapshot-$ARCH.tar.gz"
+    # Prompt for LuCI installation
+    if whiptail --title "Install LuCI" --yesno "Would you like to automatically install LuCI (graphical web interface) for the snapshot?" 10 60 3>&1 1>&2 2>&3; then
+        INSTALL_LUCI=1
+    else
+        INSTALL_LUCI=0
+    fi
+fi
 
 NEXT_CTID=$(detect_next_ctid)
 prompt_with_default "Enter Container ID" "$NEXT_CTID" CTID
@@ -172,8 +191,6 @@ detect_network_options
 WAN_OPTION=$(select_network_option "WAN" "eth0")
 LAN_OPTION=$(select_network_option "LAN" "eth1")
 
-echo -e "${RED}Note: Wan Option: $WAN_OPTION, Lan Option: $LAN_OPTION${NC}"
-
 WAN_BRIDGE=""; WAN_DEVICE=""
 if [[ "$WAN_OPTION" == bridge:* ]]; then
     WAN_BRIDGE="${WAN_OPTION#bridge:}"
@@ -200,15 +217,28 @@ SUMMARY+="  Storage: $STORAGE_SIZE GB on $STORAGE\n"
 SUMMARY+="  LAN Subnet: $SUBNET\n"
 SUMMARY+="  WAN Interface: ${WAN_BRIDGE:-${WAN_DEVICE:-None}} (eth0, DHCP/DHCPv6)\n"
 SUMMARY+="  LAN Interface: ${LAN_BRIDGE:-${LAN_DEVICE:-None}} (eth1, static)\n"
+[ "$RELEASE_TYPE" = "Snapshot" ] && [ "$INSTALL_LUCI" -eq 1 ] && SUMMARY+="  LuCI: Will be installed automatically\n"
 
-whiptail --title "Confirm Container Creation" --yesno "$SUMMARY\nProceed with container creation?" 30 60 || exit_script 0 "Container creation aborted by user"
+whiptail --title "Confirm Container Creation" --yesno "$SUMMARY\nProceed with container creation?" 20 60 || exit_script 0 "Container creation aborted by user"
 
-# Download template
+# Download template with snapshot age check
 if [ ! -f "$TEMPLATE_DIR/$TEMPLATE_FILE" ]; then
     echo -e "${GREEN}Downloading OpenWrt $VER rootfs...${NC}"
     wget -q "$DOWNLOAD_URL" -O "$TEMPLATE_DIR/$TEMPLATE_FILE" || exit_script 1 "Error: Failed to download OpenWrt $VER image"
 else
-    echo -e "${GREEN}Using existing OpenWrt image: $TEMPLATE_FILE${NC}"
+    if [ "$RELEASE_TYPE" = "Snapshot" ]; then
+        # Check if snapshot file is older than 1 day (86400 seconds)
+        FILE_AGE=$(($(date +%s) - $(stat -c %Y "$TEMPLATE_DIR/$TEMPLATE_FILE")))
+        if [ "$FILE_AGE" -gt 86400 ]; then
+            echo -e "${GREEN}Snapshot is older than 1 day, refreshing...${NC}"
+            rm -f "$TEMPLATE_DIR/$TEMPLATE_FILE"
+            wget -q "$DOWNLOAD_URL" -O "$TEMPLATE_DIR/$TEMPLATE_FILE" || exit_script 1 "Error: Failed to download OpenWrt snapshot"
+        else
+            echo -e "${GREEN}Using existing OpenWrt snapshot: $TEMPLATE_FILE${NC}"
+        fi
+    else
+        echo -e "${GREEN}Using existing OpenWrt image: $TEMPLATE_FILE${NC}"
+    fi
 fi
 
 # Build pct create command with corrected network options
@@ -230,7 +260,6 @@ pct create "$CTID" "$TEMPLATE_DIR/$TEMPLATE_FILE" \
     --ostype unmanaged \
     "${NET_OPTS[@]}" || exit_script 1 "Error: Failed to create container"
 
-
 echo -e "${GREEN}Starting container $CTID...${NC}"
 pct start "$CTID" || exit_script 1 "Error: Failed to start container"
 
@@ -239,7 +268,7 @@ sleep 10
 
 echo -e "${GREEN}Configuring network...${NC}"
 pct exec "$CTID" -- sh -c "
-    # Always configure WAN (eth0) with DHCP and DHCPv6
+    # Configure WAN (eth0) with DHCP and DHCPv6
     uci set network.wan=interface
     uci set network.wan.proto='dhcp'
     uci set network.wan.device='eth0'
@@ -247,7 +276,7 @@ pct exec "$CTID" -- sh -c "
     uci set network.wan6.proto='dhcpv6'
     uci set network.wan6.device='eth0'
 
-    # Always configure LAN (eth1) with static IP
+    # Configure LAN (eth1) with static IP
     uci set network.lan=interface
     uci set network.lan.proto='static'
     uci set network.@device[0].ports='eth1'
@@ -258,6 +287,13 @@ pct exec "$CTID" -- sh -c "
     uci commit network
     /etc/init.d/network restart" || echo -e "${RED}Warning: Network configuration failed${NC}"
 
+if [ "$RELEASE_TYPE" = "Snapshot" ] && [ "$INSTALL_LUCI" -eq 1 ]; then
+    echo -e "${GREEN}Waiting 15 seconds for internet connectivity...${NC}"
+    sleep 15
+    echo -e "${GREEN}Installing LuCI...${NC}"
+    pct exec "$CTID" -- sh -c "apk update; apk add luci" || echo -e "${RED}Warning: LuCI installation failed${NC}"
+fi
+
 [ -n "$PASSWORD" ] && {
     echo -e "${GREEN}Setting root password...${NC}"
     echo -e "$PASSWORD\n$PASSWORD" | pct exec "$CTID" -- passwd || echo -e "${RED}Warning: Failed to set root password${NC}"
@@ -267,7 +303,17 @@ echo -e "${GREEN}Container $CTID ($CTNAME) created and started!${NC}"
 echo "Next steps:"
 echo "1. Access: pct exec $CTID /bin/sh"
 echo "2. Verify network: uci show network"
-echo "3. Update: opkg update"
-echo "4. Install LuCI: opkg install luci"
-[ -n "$LAN_BRIDGE" ] || [ -n "$LAN_DEVICE" ] && echo "5. LuCI: http://$LAN_IP" || echo "5. Add eth1 to activate LAN: http://$LAN_IP"
+if [ "$RELEASE_TYPE" = "Snapshot" ]; then
+    echo "3. Update: apk update"
+    if [ "$INSTALL_LUCI" -eq 1 ]; then
+        echo "4. LuCI installed: Access at http://$LAN_IP (if LAN configured)"
+    else
+        echo "4. Install LuCI: apk add luci"
+        [ -n "$LAN_BRIDGE" ] || [ -n "$LAN_DEVICE" ] && echo "5. LuCI: http://$LAN_IP" || echo "5. Add eth1 to activate LAN: http://$LAN_IP"
+    fi
+else
+    echo "3. Update: opkg update"
+    echo "4. Install LuCI: opkg install luci"
+    [ -n "$LAN_BRIDGE" ] || [ -n "$LAN_DEVICE" ] && echo "5. LuCI: http://$LAN_IP" || echo "5. Add eth1 to activate LAN: http://$LAN_IP"
+fi
 [ -z "$PASSWORD" ] && echo "6. Set password if needed: pct exec $CTID passwd"
