@@ -28,7 +28,7 @@ exit_script() {
 # Check if running as root
 [ "$EUID" -ne 0 ] && exit_script 1 "Error: This script must be run as root"
 
-# Check required tools
+# Check required tools (NO BC!)
 for cmd in wget pct pvesm ip curl whiptail pvesh bridge stat; do
     command -v "$cmd" &>/dev/null || exit_script 1 "Error: $cmd is not installed. Please install it first."
 done
@@ -40,6 +40,15 @@ whiptail_radiolist() {
     selection=$(whiptail --title "$title" --radiolist "$prompt" "$height" "$width" "$((${#items[@]} / 3))" "${items[@]}" 3>&1 1>&2 2>&3) || \
         exit_script 1 "Error: $title selection aborted"
     echo "$selection"
+}
+
+# Whiptail inputbox function
+whiptail_input() {
+    local title="$1" prompt="$2" default="$3" var="$4"
+    local input
+    input=$(whiptail --title "$title" --inputbox "$prompt\n\nDefault: $default" 10 50 "$default" 3>&1 1>&2 2>&3) || \
+        eval "$var=\"$default\""
+    eval "$var=\"${input:-$default}\""
 }
 
 # Detect latest stable OpenWrt version (silent)
@@ -110,13 +119,6 @@ detect_next_ctid() {
     echo "${id:-100}"
 }
 
-# Prompt with default value
-prompt_with_default() {
-    local prompt="$1" default="$2" var="$3"
-    read -e -p "$prompt (default: $default): " -i "$default" input
-    eval "$var=\"${input:-$default}\""
-}
-
 # Main execution
 echo -e "${GREEN}Fetching latest stable OpenWrt version...${NC}"
 STABLE_VER=$(detect_latest_version)
@@ -129,7 +131,7 @@ RELEASE_TYPE=$(whiptail --title "OpenWrt Release Type" --radiolist \
     "Snapshot" "Latest daily snapshot" "OFF" 3>&1 1>&2 2>&3) || exit_script 1 "Error: Release type selection aborted"
 
 if [ "$RELEASE_TYPE" = "Stable" ]; then
-    prompt_with_default "Enter OpenWrt stable version" "$STABLE_VER" VER
+    whiptail_input "OpenWrt Version" "Enter OpenWrt stable version" "$STABLE_VER" VER
     DOWNLOAD_URL="https://downloads.openwrt.org/releases/$VER/targets/x86/64/openwrt-$VER-x86-64-rootfs.tar.gz"
     TEMPLATE_FILE="openwrt-$VER-$ARCH.tar.gz"
 else
@@ -145,33 +147,43 @@ else
 fi
 
 NEXT_CTID=$(detect_next_ctid)
-prompt_with_default "Enter Container ID" "$NEXT_CTID" CTID
-prompt_with_default "Enter Container Name" "openwrt-$CTID" CTNAME
+whiptail_input "Container ID" "Enter Container ID" "$NEXT_CTID" CTID
+whiptail_input "Container Name" "Enter Container Name" "openwrt-$CTID" CTNAME
 
+# Password prompt using whiptail passwordbox
 while true; do
-    read -s -p "Enter root password (leave blank to skip): " PASSWORD; echo
-    read -s -p "Confirm root password: " PASSWORD_CONFIRM; echo
+    PASSWORD=$(whiptail --title "Root Password" --passwordbox "Enter root password (leave blank to skip)" 10 50 3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && PASSWORD=""  # Cancel = blank password
+    PASSWORD_CONFIRM=$(whiptail --title "Confirm Password" --passwordbox "Confirm root password" 10 50 3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && continue  # Cancel = retry
+    
     if [ -z "$PASSWORD" ] && [ -z "$PASSWORD_CONFIRM" ]; then
         echo -e "${GREEN}Root password skipped.${NC}"
         break
     elif [ "$PASSWORD" = "$PASSWORD_CONFIRM" ]; then
         break
     else
-        echo -e "${RED}Passwords do not match. Please try again.${NC}"
+        whiptail --title "Error" --msgbox "Passwords do not match. Please try again." 8 50
     fi
 done
 
-prompt_with_default "Enter memory size in MB" "$DEFAULT_MEMORY" MEMORY
-prompt_with_default "Enter number of CPU cores" "$DEFAULT_CORES" CORES
-prompt_with_default "Enter storage limit in GB" "$DEFAULT_STORAGE" STORAGE_SIZE
-prompt_with_default "Enter LAN subnet" "$DEFAULT_SUBNET" SUBNET
+# sysntpd prompt (DEFAULT: DISABLED)
+DISABLE_SYNTPD=$(whiptail --title "Disable sysntpd Service" --radiolist \
+    "Disable sysntpd (NTP time sync service)?\n\nThis removes sysntpd from startup (recommended for containers).\nUse Spacebar to select." 12 60 2 \
+    "Yes" "Disable sysntpd (DEFAULT)" "ON" \
+    "No" "Keep sysntpd enabled" "OFF" 3>&1 1>&2 2>&3) || exit_script 1 "Error: sysntpd selection aborted"
 
-# Validate inputs
+whiptail_input "Memory Size" "Enter memory size in MB" "$DEFAULT_MEMORY" MEMORY
+whiptail_input "CPU Cores" "Enter number of CPU cores" "$DEFAULT_CORES" CORES
+whiptail_input "Storage Size" "Enter storage limit in GB" "$DEFAULT_STORAGE" STORAGE_SIZE
+whiptail_input "LAN Subnet" "Enter LAN subnet" "$DEFAULT_SUBNET" SUBNET
+
+# YOUR ORIGINAL STORAGE LOGIC - FIXED WITH AWK
 [[ "$CTID" =~ ^[0-9]+$ && "$CTID" -ge 100 ]] || exit_script 1 "Error: Container ID must be a number >= 100"
 pct list | awk '{print $1}' | grep -q "^$CTID$" && exit_script 1 "Error: Container ID $CTID is already in use"
 [[ "$MEMORY" =~ ^[0-9]+$ && "$MEMORY" -ge 64 ]] || exit_script 1 "Error: Memory size must be a number >= 64 MB"
-[[ "$CORES" =~ ^[0-9]+$ && "$CORES" -ge 1 ]] || exit_script 1 "Error: Core count must be a number >= 1"
-[[ "$STORAGE_SIZE" =~ ^[0-9]*\.?[0-9]+$ && "$(echo "$STORAGE_SIZE > 0" | bc)" -eq 1 ]] || exit_script 1 "Error: Storage limit must be a positive number"
+[[ "$CORES" =~ ^[0-9]+$ && "$CORES" -ge 1 ]] || exit_script 1 "Core count must be a number >= 1"
+[[ "$STORAGE_SIZE" =~ ^[0-9]*\.?[0-9]+$ && $(echo "$STORAGE_SIZE > 0" | awk '{if ($1 > 0) print 1; else print 0}') -eq 1 ]] || exit_script 1 "Error: Storage limit must be a positive number"
 
 # Parse subnet
 LAN_IP=$(echo "$SUBNET" | cut -d'/' -f1)
@@ -192,16 +204,16 @@ WAN_OPTION=$(select_network_option "WAN" "eth0")
 LAN_OPTION=$(select_network_option "LAN" "eth1")
 
 WAN_BRIDGE=""; WAN_DEVICE=""
-if [[ "$WAN_OPTION" == bridge:* ]]; then
+if [ "${WAN_OPTION#bridge:}" != "$WAN_OPTION" ]; then
     WAN_BRIDGE="${WAN_OPTION#bridge:}"
-elif [[ "$WAN_OPTION" == device:* ]]; then
+elif [ "${WAN_OPTION#device:}" != "$WAN_OPTION" ]; then
     WAN_DEVICE="${WAN_OPTION#device:}"
 fi
 
 LAN_BRIDGE=""; LAN_DEVICE=""
-if [[ "$LAN_OPTION" == bridge:* ]]; then
+if [ "${LAN_OPTION#bridge:}" != "$LAN_OPTION" ]; then
     LAN_BRIDGE="${LAN_OPTION#bridge:}"
-elif [[ "$LAN_OPTION" == device:* ]]; then
+elif [ "${LAN_OPTION#device:}" != "$LAN_OPTION" ]; then
     LAN_DEVICE="${LAN_OPTION#device:}"
 fi
 
@@ -211,6 +223,7 @@ SUMMARY+="  OpenWrt Version: $VER\n"
 SUMMARY+="  Container ID: $CTID\n"
 SUMMARY+="  Container Name: $CTNAME\n"
 SUMMARY+="  Root Password: $( [ -n "$PASSWORD" ] && echo "Set" || echo "Not set" )\n"
+SUMMARY+="  sysntpd Service: $( [ "$DISABLE_SYNTPD" = "Yes" ] && echo "DISABLED" || echo "Enabled" )\n"
 SUMMARY+="  Memory: $MEMORY MB\n"
 SUMMARY+="  CPU Cores: $CORES\n"
 SUMMARY+="  Storage: $STORAGE_SIZE GB on $STORAGE\n"
@@ -219,7 +232,7 @@ SUMMARY+="  WAN Interface: ${WAN_BRIDGE:-${WAN_DEVICE:-None}} (eth0, DHCP/DHCPv6
 SUMMARY+="  LAN Interface: ${LAN_BRIDGE:-${LAN_DEVICE:-None}} (eth1, static)\n"
 [ "$RELEASE_TYPE" = "Snapshot" ] && [ "$INSTALL_LUCI" -eq 1 ] && SUMMARY+="  LuCI: Will be installed automatically\n"
 
-whiptail --title "Confirm Container Creation" --yesno "$SUMMARY\nProceed with container creation?" 20 60 || exit_script 0 "Container creation aborted by user"
+whiptail --title "Confirm Container Creation" --yesno "$SUMMARY\nProceed with container creation?" 22 60 || exit_script 0 "Container creation aborted by user"
 
 # Download template with snapshot age check
 if [ ! -f "$TEMPLATE_DIR/$TEMPLATE_FILE" ]; then
@@ -266,6 +279,12 @@ pct start "$CTID" || exit_script 1 "Error: Failed to start container"
 pct exec "$CTID" -- sh -c "sed -i 's!procd_add_jail!: procd_add_jail!g' /etc/init.d/dnsmasq"
 sleep 10
 
+# Disable sysntpd if selected
+if [ "$DISABLE_SYNTPD" = "Yes" ]; then
+    echo -e "${GREEN}Disabling sysntpd service...${NC}"
+    pct exec "$CTID" -- sh -c "rm -f /etc/rc.d/*sysntpd" || echo -e "${RED}Warning: Failed to disable sysntpd${NC}"
+fi
+
 echo -e "${GREEN}Configuring network...${NC}"
 pct exec "$CTID" -- sh -c "
     # Configure WAN (eth0) with DHCP and DHCPv6
@@ -303,17 +322,25 @@ echo -e "${GREEN}Container $CTID ($CTNAME) created and started!${NC}"
 echo "Next steps:"
 echo "1. Access: pct exec $CTID /bin/sh"
 echo "2. Verify network: uci show network"
-if [ "$RELEASE_TYPE" = "Snapshot" ]; then
-    echo "3. Update: apk update"
-    if [ "$INSTALL_LUCI" -eq 1 ]; then
-        echo "4. LuCI installed: Access at http://$LAN_IP (if LAN configured)"
-    else
-        echo "4. Install LuCI: apk add luci"
-        [ -n "$LAN_BRIDGE" ] || [ -n "$LAN_DEVICE" ] && echo "5. LuCI: http://$LAN_IP" || echo "5. Add eth1 to activate LAN: http://$LAN_IP"
-    fi
+if [ "$DISABLE_SYNTPD" = "Yes" ]; then
+    echo "3. sysntpd: Disabled (removed from startup)"
+    NEXT_NUM=4
 else
-    echo "3. Update: opkg update"
-    echo "4. Install LuCI: opkg install luci"
-    [ -n "$LAN_BRIDGE" ] || [ -n "$LAN_DEVICE" ] && echo "5. LuCI: http://$LAN_IP" || echo "5. Add eth1 to activate LAN: http://$LAN_IP"
+    NEXT_NUM=3
 fi
-[ -z "$PASSWORD" ] && echo "6. Set password if needed: pct exec $CTID passwd"
+
+if [ "$RELEASE_TYPE" = "Stable" ]; then
+    echo "$NEXT_NUM. LuCI: http://$LAN_IP (if LAN configured)"
+    [ -z "$PASSWORD" ] && echo "$((NEXT_NUM + 1)). Set password if needed: pct exec $CTID passwd"
+else
+    # Snapshot
+    if [ "$INSTALL_LUCI" -eq 1 ]; then
+        echo "$NEXT_NUM. LuCI installed: Access at http://$LAN_IP (if LAN configured)"
+        [ -z "$PASSWORD" ] && echo "$((NEXT_NUM + 1)). Set password if needed: pct exec $CTID passwd"
+    else
+        echo "$NEXT_NUM. Update: apk update"
+        echo "$((NEXT_NUM + 1)). Install LuCI: apk add luci"
+        [ -n "$LAN_BRIDGE" ] || [ -n "$LAN_DEVICE" ] && echo "$((NEXT_NUM + 2)). LuCI: http://$LAN_IP" || echo "$((NEXT_NUM + 2)). Add eth1 to activate LAN: http://$LAN_IP"
+        [ -z "$PASSWORD" ] && echo "$((NEXT_NUM + 3)). Set password if needed: pct exec $CTID passwd"
+    fi
+fi
