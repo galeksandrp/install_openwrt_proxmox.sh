@@ -57,7 +57,7 @@ whiptail_input() {
 detect_latest_stable() {
     local ver
     ver=$(curl -sSf "https://downloads.openwrt.org/" |
-          grep -oP '(?<=OpenWrt )\d+\.\d+\.\d+(?=\s|</strong>|Released)' |
+          grep -oP '(?<=OpenWrt )\d+\.\d+\.\d+(?=\s|</a></strong>|Released)' |
           head -1)
     if [ -z "$ver" ]; then
         ver=$(curl -sSf "https://downloads.openwrt.org/releases/" |
