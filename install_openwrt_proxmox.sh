@@ -158,7 +158,7 @@ RELEASE_TYPE=$(whiptail --title "Release Type" --radiolist \
 if [ "$RELEASE_TYPE" = "Stable" ]; then
     whiptail_input "OpenWrt Version" "Enter version (stable or RC)" "$VER" VER \
         || exit_script 1 "Aborted by user"
-    DOWNLOAD_URL="https://downloads.openwrt.org/releases/$VER/targets/x86/64/openwrt-${VER}-x86-64-rootfs.tar.gz"
+    DOWNLOAD_URL="https://github.com/galeksandrp/install_openwrt_proxmox.sh/releases/download/$VER/openwrt-${VER}-x86-64-generic-rootfs.tar.gz"
     TEMPLATE_FILE="openwrt-${VER}-${ARCH}.tar.gz"
 else
     VER="snapshot"
